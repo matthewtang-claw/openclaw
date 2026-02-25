@@ -36,6 +36,10 @@ import { recordChannelActivity } from "../infra/channel-activity.js";
 import { resolveAgentRoute } from "../routing/resolve-route.js";
 import { resolveThreadSessionKeys } from "../routing/session-key.js";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
+import {
+  buildTelegramForumThreadLabel,
+  recordTelegramForumTopicTitleFromMessage,
+} from "./topic-titles.js";
 import { firstDefined, isSenderAllowed, normalizeAllowFromWithStore } from "./bot-access.js";
 import {
   buildGroupLabel,
@@ -153,6 +157,8 @@ export const buildTelegramMessageContext = async ({
   resolveTelegramGroupConfig,
 }: BuildTelegramMessageContextParams) => {
   const msg = primaryCtx.message;
+  // Capture forum topic title changes from service messages (create/edit).
+  recordTelegramForumTopicTitleFromMessage(msg);
   const chatId = msg.chat.id;
   const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
   const messageThreadId = (msg as { message_thread_id?: number }).message_thread_id;
@@ -618,6 +624,14 @@ export const buildTelegramMessageContext = async ({
     topicConfig,
   });
   const commandBody = normalizeCommandBody(rawBody, { botUsername });
+  const threadLabel =
+    isGroup && isForum && typeof resolvedThreadId === "number"
+      ? buildTelegramForumThreadLabel({
+          chatId,
+          threadId: resolvedThreadId,
+          chatTitle: msg.chat.title ?? undefined,
+        })
+      : undefined;
   const inboundHistory =
     isGroup && historyKey && historyLimit > 0
       ? (groupHistories.get(historyKey) ?? []).map((entry) => ({
@@ -695,6 +709,7 @@ export const buildTelegramMessageContext = async ({
     CommandAuthorized: commandAuthorized,
     // For groups: use resolved forum topic id; for DMs: use raw messageThreadId
     MessageThreadId: threadSpec.id,
+    ThreadLabel: threadLabel,
     IsForum: isForum,
     // Originating channel for reply routing.
     OriginatingChannel: "telegram" as const,

@@ -4,6 +4,7 @@ import type {
   ReactionType,
   ReactionTypeEmoji,
 } from "@grammyjs/types";
+import { setTimeout as delay } from "node:timers/promises";
 import { type ApiClientOptions, Bot, HttpError, InputFile } from "grammy";
 import { loadConfig } from "../config/config.js";
 import { resolveMarkdownTableMode } from "../config/markdown-tables.js";
@@ -93,6 +94,42 @@ const MESSAGE_NOT_MODIFIED_RE =
 const CHAT_NOT_FOUND_RE = /400: Bad Request: chat not found/i;
 const sendLogger = createSubsystemLogger("telegram/send");
 const diagLogger = createSubsystemLogger("telegram/diagnostic");
+
+// Optional outbound quota (soft throttle) to reduce Telegram 429s and burst spam.
+// This is *in addition* to grammY's apiThrottler, and is scoped per account+chat+thread.
+const lastOutboundSendAt = new Map<string, number>();
+
+function resolveOutboundMinIntervalMs(cfg: ReturnType<typeof loadConfig>, accountId: string) {
+  const telegramCfg = cfg.channels?.telegram as unknown as {
+    quota?: { outboundMinIntervalMs?: number };
+    accounts?: Record<string, { quota?: { outboundMinIntervalMs?: number } }>;
+  };
+  const perAccount = telegramCfg?.accounts?.[accountId]?.quota?.outboundMinIntervalMs;
+  const global = telegramCfg?.quota?.outboundMinIntervalMs;
+  const value = typeof perAccount === "number" ? perAccount : global;
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+async function applyOutboundQuota(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  accountId: string;
+  chatId: string;
+  messageThreadId?: number;
+}) {
+  const minIntervalMs = resolveOutboundMinIntervalMs(params.cfg, params.accountId);
+  if (!minIntervalMs) {
+    return;
+  }
+  const threadKey = typeof params.messageThreadId === "number" ? `:topic:${params.messageThreadId}` : "";
+  const key = `telegram:${params.accountId}:${params.chatId}${threadKey}`;
+  const now = Date.now();
+  const last = lastOutboundSendAt.get(key) ?? 0;
+  const waitMs = last ? minIntervalMs - (now - last) : 0;
+  if (waitMs > 0) {
+    await delay(waitMs);
+  }
+  lastOutboundSendAt.set(key, Date.now());
+}
 
 function createTelegramHttpLogger(cfg: ReturnType<typeof loadConfig>) {
   const enabled = isDiagnosticFlagEnabled("telegram.http", cfg);
@@ -501,6 +538,12 @@ export async function sendMessageTelegram(
     params?: Record<string, unknown>,
     fallbackText?: string,
   ) => {
+    await applyOutboundQuota({
+      cfg,
+      accountId: account.accountId,
+      chatId,
+      messageThreadId: messageThreadId ?? undefined,
+    });
     return await withTelegramThreadFallback(
       params,
       "message",
@@ -548,6 +591,12 @@ export async function sendMessageTelegram(
   };
 
   if (mediaUrl) {
+    await applyOutboundQuota({
+      cfg,
+      accountId: account.accountId,
+      chatId,
+      messageThreadId: messageThreadId ?? undefined,
+    });
     const media = await loadWebMedia(mediaUrl, {
       maxBytes: opts.maxBytes,
       localRoots: opts.mediaLocalRoots,
@@ -1004,6 +1053,13 @@ export async function sendStickerTelegram(
   });
 
   const stickerParams = hasThreadParams ? threadParams : undefined;
+
+  await applyOutboundQuota({
+    cfg,
+    accountId: account.accountId,
+    chatId,
+    messageThreadId: opts.messageThreadId ?? target.messageThreadId ?? undefined,
+  });
 
   const result = await withTelegramThreadFallback(
     stickerParams,
