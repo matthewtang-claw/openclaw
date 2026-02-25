@@ -1,19 +1,42 @@
 services:
   openclaw-gateway:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    build:
+      context: .
+      args:
+        OPENCLAW_DOCKER_APT_PACKAGES: >-
+          socat
+          jq
+          maven
+          chromium
+          chromium-driver
+          xdg-utils
+          fonts-liberation
+          libnss3
+          libxss1
+          libasound2
+          libgbm1
+          libgtk-3-0
+          libatk-bridge2.0-0
+          libdrm2
+          default-mysql-client
+    env_file:
+      - .env
     environment:
       HOME: /home/node
+      NODE_ENV: production
       TERM: xterm-256color
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
-      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
-      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
-      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD}
+      XDG_CONFIG_HOME: ${XDG_CONFIG_HOME}
+      PATH: /home/linuxbrew/.linuxbrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
     ports:
-      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
-      - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789" # gateway
+      - "127.0.0.1:18791:18791" # browser
+      - "127.0.0.1:18792:18792" # relay
     init: true
     restart: unless-stopped
     command:
@@ -24,7 +47,7 @@ services:
         "--bind",
         "${OPENCLAW_GATEWAY_BIND:-lan}",
         "--port",
-        "18789",
+        "${OPENCLAW_GATEWAY_PORT:-18789}",
       ]
 
   openclaw-cli:
@@ -33,10 +56,6 @@ services:
       HOME: /home/node
       TERM: xterm-256color
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
-      BROWSER: echo
-      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
-      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
-      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
@@ -44,3 +63,17 @@ services:
     tty: true
     init: true
     entrypoint: ["node", "dist/index.js"]
+
+  cdp-browser:
+    image: chromedp/headless-shell:latest
+    restart: unless-stopped
+    command:
+      - --no-sandbox
+      - --disable-dev-shm-usage
+      - --remote-debugging-address=0.0.0.0
+      - --remote-debugging-port=9223
+      - --remote-allow-origins=*
+      - about:blank
+    expose:
+      - "9222"
+      - "9223"
