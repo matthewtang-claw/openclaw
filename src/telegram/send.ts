@@ -507,6 +507,7 @@ export async function sendMessageTelegram(
     replyToMessageId: opts.replyToMessageId,
     quoteText: opts.quoteText,
   });
+  const quotaThreadId = opts.messageThreadId ?? target.messageThreadId;
   const hasThreadParams = Object.keys(threadParams).length > 0;
   const requestWithDiag = createTelegramRequestWithDiag({
     cfg,
@@ -542,7 +543,7 @@ export async function sendMessageTelegram(
       cfg,
       accountId: account.accountId,
       chatId,
-      messageThreadId: messageThreadId ?? undefined,
+      messageThreadId: quotaThreadId ?? undefined,
     });
     return await withTelegramThreadFallback(
       params,
@@ -595,7 +596,7 @@ export async function sendMessageTelegram(
       cfg,
       accountId: account.accountId,
       chatId,
-      messageThreadId: messageThreadId ?? undefined,
+      messageThreadId: quotaThreadId ?? undefined,
     });
     const media = await loadWebMedia(mediaUrl, {
       maxBytes: opts.maxBytes,
