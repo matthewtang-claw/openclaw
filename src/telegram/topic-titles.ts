@@ -61,6 +61,28 @@ export function resolveTelegramForumTopicTitle(chatId: number, threadId: number)
   return entry?.title?.trim() ? entry.title.trim() : null;
 }
 
+export function listTelegramForumTopicTitles(chatId: number): Array<{ threadId: number; title: string }> {
+  const state = loadState();
+  const prefix = `${String(chatId)}:`;
+  const results: Array<{ threadId: number; title: string }> = [];
+  for (const [key, entry] of Object.entries(state.topics)) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const threadIdRaw = key.slice(prefix.length);
+    const threadId = Number.parseInt(threadIdRaw, 10);
+    if (!Number.isFinite(threadId)) {
+      continue;
+    }
+    const title = entry?.title?.trim();
+    if (!title) {
+      continue;
+    }
+    results.push({ threadId, title });
+  }
+  return results.toSorted((a, b) => a.threadId - b.threadId);
+}
+
 /**
  * Extract and persist forum topic titles from incoming Telegram messages.
  *

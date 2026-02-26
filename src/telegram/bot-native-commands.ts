@@ -66,6 +66,16 @@ import {
 } from "./group-access.js";
 import { resolveTelegramGroupPromptSettings } from "./group-config-helpers.js";
 import { buildInlineKeyboard } from "./send.js";
+import {
+  addQuotaAdmin,
+  getUsageSnapshot,
+  isQuotaAdmin,
+  resolveMaxOutputReserveTokens,
+  resolveUsageWindow,
+  setLimitTokens,
+  type UsageBucketKey,
+} from "./usage-limits.js";
+import { listTelegramForumTopicTitles } from "./topic-titles.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 
@@ -484,6 +494,163 @@ export const registerTelegramNativeCommands = ({
               isForum,
               resolvedThreadId,
             });
+
+          // Deterministic quota management (topic 668): handled in code, not via LLM.
+          if (command.name.toLowerCase() === "quota") {
+            const window = resolveUsageWindow(cfg);
+            const accountKey = `telegram:${route.accountId ?? accountId}`;
+            const senderKey = senderId ? `telegram:user:${senderId}` : null;
+            const topicKey =
+              typeof resolvedThreadId === "number"
+                ? `telegram:chat:${chatId}:topic:${resolvedThreadId}`
+                : null;
+            const buckets: UsageBucketKey[] = [{ scope: "global", key: accountKey }];
+            if (senderKey) buckets.push({ scope: "user", key: senderKey });
+            if (topicKey) buckets.push({ scope: "topic", key: topicKey });
+
+            const replyText = (text: string) =>
+              withTelegramApiErrorLogging({
+                operation: "sendMessage",
+                runtime,
+                fn: () => bot.api.sendMessage(chatId, text, { ...(buildTelegramThreadParams(threadSpec) ?? {}) }),
+              });
+
+            const raw = (ctx.match ?? "").trim();
+            const parts = raw ? raw.split(/\s+/) : [];
+            const sub = (parts[0] ?? "status").toLowerCase();
+
+            const requireAdmin = async () => {
+              if (!isQuotaAdmin(cfg, senderId)) {
+                await replyText("Not authorized. Ask an admin to run this /quota command.");
+                return false;
+              }
+              return true;
+            };
+
+            const formatBucket = (bucket: UsageBucketKey) => {
+              const snap = getUsageSnapshot({ cfg, window, bucket });
+              const remaining = snap.remainingTokens == null ? "unlimited" : String(snap.remainingTokens);
+              const limit = snap.limitTokens == null ? "unlimited" : String(snap.limitTokens);
+              return `${bucket.scope}: used=${snap.usedTokens} reserved=${snap.reservedTokens} remaining=${remaining} limit=${limit}`;
+            };
+
+            if (sub === "whoami") {
+              await replyText(
+                [`userId=${senderId}`, senderUsername ? `username=@${senderUsername}` : null]
+                  .filter(Boolean)
+                  .join("\n"),
+              );
+              return;
+            }
+
+            if (sub === "topics") {
+              if (!isForum) {
+                await replyText("This chat is not a forum. No topics to list.");
+                return;
+              }
+              const titles = listTelegramForumTopicTitles(chatId);
+              if (titles.length === 0) {
+                await replyText("No topic titles cached yet. Rename/create a topic and try again.");
+                return;
+              }
+              const lines = titles.map((t) => `topic:${t.threadId} -> ${t.title}`);
+              await replyText(lines.join("\n"));
+              return;
+            }
+
+            if (sub === "status") {
+              const lines = [`Window: daily ${window.id} (${window.timeZone})`];
+              for (const b of buckets) {
+                lines.push(`- ${formatBucket(b)}`);
+              }
+              lines.push(`Reserve max output tokens: ${resolveMaxOutputReserveTokens(cfg)}`);
+              await replyText(lines.join("\n"));
+              return;
+            }
+
+            if (sub === "set") {
+              if (!(await requireAdmin())) return;
+              const scope = (parts[1] ?? "").toLowerCase();
+              const target = parts[2] ?? "";
+              const windowKind = (parts[3] ?? "daily").toLowerCase();
+              const tokensRaw = parts[4] ?? parts[3] ?? "";
+
+              if (windowKind !== "daily") {
+                await replyText("Only 'daily' window is supported in v1.");
+                return;
+              }
+
+              const tokens = Number.parseInt(tokensRaw, 10);
+              if (!Number.isFinite(tokens)) {
+                await replyText("Usage: /quota set <global|user|topic> <target> daily <tokens>");
+                return;
+              }
+
+              if (scope === "global") {
+                setLimitTokens({ cfg, scope: "global", key: accountKey, windowKind: "daily", limitTokens: tokens });
+                await replyText(`Set global dailyTokens=${tokens}`);
+                return;
+              }
+
+              if (scope === "user") {
+                const replyUserId = msg.reply_to_message?.from?.id;
+                const resolvedUserId =
+                  target === "me"
+                    ? senderId
+                    : replyUserId != null && !target
+                      ? String(replyUserId)
+                      : /^\d+$/.test(target)
+                        ? target
+                        : null;
+                if (!resolvedUserId) {
+                  await replyText("Provide a numeric userId, 'me', or reply to the user's message.");
+                  return;
+                }
+                const key = `telegram:user:${resolvedUserId}`;
+                setLimitTokens({ cfg, scope: "user", key, windowKind: "daily", limitTokens: tokens });
+                await replyText(`Set user ${resolvedUserId} dailyTokens=${tokens}`);
+                return;
+              }
+
+              if (scope === "topic") {
+                const topicIdRaw = target.startsWith("topic:") ? target.slice("topic:".length) : target;
+                const topicId = Number.parseInt(topicIdRaw, 10);
+                if (!Number.isFinite(topicId)) {
+                  await replyText("Provide a topic id like topic:668 (see /quota topics).");
+                  return;
+                }
+                const key = `telegram:chat:${chatId}:topic:${topicId}`;
+                setLimitTokens({ cfg, scope: "topic", key, windowKind: "daily", limitTokens: tokens });
+                await replyText(`Set topic ${topicId} dailyTokens=${tokens}`);
+                return;
+              }
+
+              await replyText("Unknown scope. Use global|user|topic.");
+              return;
+            }
+
+            if (sub === "admin") {
+              if (!(await requireAdmin())) return;
+              const action = (parts[1] ?? "").toLowerCase();
+              if (action === "add") {
+                const replyUserId = msg.reply_to_message?.from?.id;
+                const idArg = parts[2] ?? "";
+                const resolved = replyUserId != null && !idArg ? String(replyUserId) : idArg;
+                if (!/^\d+$/.test(resolved)) {
+                  await replyText("Usage: /quota admin add <numericUserId> (or reply to user)");
+                  return;
+                }
+                addQuotaAdmin(cfg, resolved);
+                await replyText(`Added admin: ${resolved}`);
+                return;
+              }
+              await replyText("Supported: /quota admin add <userId> (v1)");
+              return;
+            }
+
+            await replyText("Unknown /quota subcommand. Try: /quota status | /quota topics | /quota whoami");
+            return;
+          }
           const deliveryBaseOptions = buildCommandDeliveryBaseOptions({
             chatId,
             mediaLocalRoots,

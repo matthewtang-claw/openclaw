@@ -35,6 +35,18 @@ import {
   buildEmbeddedRunContexts,
   resolveModelFallbackOptions,
 } from "./agent-runner-utils.js";
+import {
+  estimateTokensFromText,
+  getUsageSnapshot,
+  isUsageLimitsEnabled,
+  reconcileTokens,
+  releaseReservation,
+  reserveTokens,
+  resolveMaxOutputReserveTokens,
+  resolveUsageWindow,
+  type UsageBucketKey,
+} from "../../telegram/usage-limits.js";
+import { parseTelegramTarget } from "../../telegram/targets.js";
 import { type BlockReplyPipeline } from "./block-reply-pipeline.js";
 import type { FollowupRun } from "./queue.js";
 import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
@@ -99,6 +111,88 @@ export async function runAgentTurnWithFallback(params: {
   const directlySentBlockKeys = new Set<string>();
 
   const runId = params.opts?.runId ?? crypto.randomUUID();
+
+  // Telegram usage limits (topic 668): reserve budget BEFORE calling LLM.
+  const shouldApplyTelegramUsageLimits = (() => {
+    const surface = String(params.sessionCtx.Surface ?? params.sessionCtx.Provider ?? "").toLowerCase();
+    if (surface !== "telegram") {
+      return false;
+    }
+    if (!isUsageLimitsEnabled(params.followupRun.run.config)) {
+      return false;
+    }
+    const body = params.commandBody.trim();
+    // Never charge quota-management commands.
+    if (/^\/(?:quota)\b/i.test(body)) {
+      return false;
+    }
+    return true;
+  })();
+
+  const usageWindow = shouldApplyTelegramUsageLimits
+    ? resolveUsageWindow(params.followupRun.run.config)
+    : null;
+
+  const usageBuckets: UsageBucketKey[] = shouldApplyTelegramUsageLimits
+    ? (() => {
+        const from = String(params.sessionCtx.From ?? "");
+        const target = parseTelegramTarget(from);
+        const chatId = target.chatId;
+        const threadId = target.messageThreadId;
+        const senderId = String(params.sessionCtx.SenderId ?? "").trim();
+        const accountId = String(params.sessionCtx.AccountId ?? "default").trim() || "default";
+        const buckets: UsageBucketKey[] = [{ scope: "global", key: `telegram:${accountId}` }];
+        if (senderId) {
+          buckets.push({ scope: "user", key: `telegram:user:${senderId}` });
+        }
+        if (chatId && typeof threadId === "number") {
+          buckets.push({ scope: "topic", key: `telegram:chat:${chatId}:topic:${threadId}` });
+        }
+        return buckets;
+      })()
+    : [];
+
+  const reservedTokens = shouldApplyTelegramUsageLimits && usageWindow
+    ? (() => {
+        const promptEstimate = estimateTokensFromText(params.commandBody);
+        const reserve = promptEstimate + resolveMaxOutputReserveTokens(params.followupRun.run.config);
+        const result = reserveTokens({
+          cfg: params.followupRun.run.config,
+          runId,
+          window: usageWindow,
+          buckets: usageBuckets,
+          reserveTokens: reserve,
+        });
+        if (!result.ok) {
+          // Build a short but informative message.
+          const lines: string[] = [
+            `Usage limit reached (daily, ${usageWindow.timeZone}).`,
+            `Reason: ${result.reason}.`,
+          ];
+          // Include relevant bucket snapshots if possible.
+          for (const bucket of usageBuckets) {
+            const snap = getUsageSnapshot({
+              cfg: params.followupRun.run.config,
+              window: usageWindow,
+              bucket,
+            });
+            const label = `${bucket.scope}`;
+            const remaining = snap.remainingTokens == null ? "unlimited" : String(snap.remainingTokens);
+            const limit = snap.limitTokens == null ? "unlimited" : String(snap.limitTokens);
+            lines.push(
+              `- ${label}: used=${snap.usedTokens} reserved=${snap.reservedTokens} remaining=${remaining} limit=${limit}`,
+            );
+          }
+          return { kind: "final" as const, payload: { text: lines.join("\n"), isError: true } };
+        }
+        return { kind: "ok" as const, reserveTokens: result.reservedTokens };
+      })()
+    : { kind: "ok" as const, reserveTokens: 0 };
+
+  if (reservedTokens.kind === "final") {
+    return reservedTokens;
+  }
+
   let didNotifyAgentRunStart = false;
   const notifyAgentRunStart = () => {
     if (didNotifyAgentRunStart) {
@@ -121,8 +215,11 @@ export async function runAgentTurnWithFallback(params: {
   let didResetAfterCompactionFailure = false;
   let didRetryTransientHttpError = false;
 
-  while (true) {
-    try {
+  let didReconcileUsage = false;
+
+  try {
+    while (true) {
+      try {
       const normalizeStreamingText = (payload: ReplyPayload): { text?: string; skip: boolean } => {
         let text = payload.text;
         if (!params.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
@@ -429,6 +526,45 @@ export async function runAgentTurnWithFallback(params: {
           }))
         : [];
 
+      // Reconcile reserved usage with actual tokens when available.
+      if (shouldApplyTelegramUsageLimits && usageWindow && !didReconcileUsage) {
+        const usage = runResult.meta?.agentMeta?.usage;
+        const actualTokens =
+          typeof usage === "object" && usage
+            ? Math.max(
+                0,
+                Math.trunc(
+                  (usage.input ?? 0) +
+                    (usage.output ?? 0) +
+                    (usage.cacheRead ?? 0) +
+                    (usage.cacheWrite ?? 0),
+                ),
+              )
+            : reservedTokens.reserveTokens;
+        try {
+          reconcileTokens({
+            cfg: params.followupRun.run.config,
+            runId,
+            window: usageWindow,
+            buckets: usageBuckets,
+            actualTokens,
+          });
+          didReconcileUsage = true;
+        } catch (err) {
+          // Fail open (do not block reply) but avoid leaking reservations.
+          try {
+            releaseReservation({
+              cfg: params.followupRun.run.config,
+              runId,
+              window: usageWindow,
+              buckets: usageBuckets,
+            });
+          } catch {
+            // ignore
+          }
+        }
+      }
+
       // Some embedded runs surface context overflow as an error payload instead of throwing.
       // Treat those as a session-level failure and auto-recover by starting a fresh session.
       const embeddedError = runResult.meta?.error;
@@ -583,4 +719,19 @@ export async function runAgentTurnWithFallback(params: {
     autoCompactionCompleted,
     directlySentBlockKeys: directlySentBlockKeys.size > 0 ? directlySentBlockKeys : undefined,
   };
+} finally {
+  // Always attempt to release any leftover reservations (reconcile deletes them).
+  if (shouldApplyTelegramUsageLimits && usageWindow && !didReconcileUsage) {
+    try {
+      releaseReservation({
+        cfg: params.followupRun.run.config,
+        runId,
+        window: usageWindow,
+        buckets: usageBuckets,
+      });
+    } catch {
+      // ignore
+    }
+  }
 }
+
