@@ -173,6 +173,14 @@ function buildChatCommands(): ChatCommandDefinition[] {
       category: "status",
     }),
     defineChatCommand({
+      key: "quota",
+      nativeName: "quota",
+      description: "View/manage token usage limits.",
+      textAlias: "/quota",
+      acceptsArgs: true,
+      category: "management",
+    }),
+    defineChatCommand({
       key: "allowlist",
       description: "List/add/remove allowlist entries.",
       textAlias: "/allowlist",
