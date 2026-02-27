@@ -185,6 +185,25 @@ export const TelegramAccountSchemaBase = z
     linkPreview: z.boolean().optional(),
     responsePrefix: z.string().optional(),
     ackReaction: z.string().optional(),
+
+    // Telegram usage limits (/quota) + pre-LLM gating.
+    usageLimits: z
+      .object({
+        enabled: z.boolean().optional(),
+        timeZone: z.string().optional(),
+        maxOutputReserveTokens: z.number().int().min(0).optional(),
+        bootstrapAdminUserIds: z.array(z.string()).optional(),
+        limits: z
+          .object({
+            globalDailyTokens: z.number().int().min(0).optional(),
+            perUserDailyTokens: z.number().int().min(0).optional(),
+            perTopicDailyTokens: z.number().int().min(0).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

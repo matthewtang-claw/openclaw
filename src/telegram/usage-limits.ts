@@ -133,7 +133,9 @@ export function resolveMaxOutputReserveTokens(cfg: OpenClawConfig): number {
 
 export function isUsageLimitsEnabled(cfg: OpenClawConfig): boolean {
   const limitsCfg = resolveTelegramUsageLimitsConfig(cfg);
-  return limitsCfg.enabled !== false;
+  // Safety default: disabled unless explicitly enabled in config.
+  // This avoids surprising lockouts when someone upgrades without configuring quotas.
+  return limitsCfg.enabled === true;
 }
 
 function nowIso(): string {
